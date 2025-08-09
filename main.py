@@ -4,21 +4,12 @@ from dotenv import load_dotenv
 import os
 import datetime
 import time
+import json
+import io
 
 load_dotenv()
 
-schedules = [
-    {
-        'id': 1,
-        'server': 1257295111331647554,
-        'channel': 1259383023728590908,
-        'message': 'Scheduler Test',
-        'user': 977572024853598238,
-        'date': 1754644211,
-        'interval': 3600,
-        'last': 0
-    }
-]
+schedules = []
 
 next_id = 2  # 다음 스케줄 ID
 
@@ -149,8 +140,8 @@ class ScheduleCreateModal(discord.ui.Modal, title="📅 새 스케줄 생성"):
             hour, minute = map(int, time_parts)
 
             # 간격 파싱
-            interval_hours = int(self.interval.value)
-            if interval_hours <= 0:
+            interval_minutes = int(self.interval.value)
+            if interval_minutes <= 0:
                 raise ValueError("간격은 0보다 커야 합니다")
 
             # 날짜 유효성 검사
@@ -173,7 +164,7 @@ class ScheduleCreateModal(discord.ui.Modal, title="📅 새 스케줄 생성"):
                 'message': self.message.value,
                 'user': interaction.user.id,
                 'date': timestamp,
-                'interval': interval_hours * 60,  # 시간을 초로 변환
+                'interval': interval_minutes * 60,  # 분을 초로 변환
                 'last': 0
             }
 
@@ -203,7 +194,7 @@ class ScheduleCreateModal(discord.ui.Modal, title="📅 새 스케줄 생성"):
                 description="올바른 형식으로 입력해주세요:\n"
                             "• **날짜**: YYYY-MM-DD (예: 2025-12-25)\n"
                             "• **시간**: HH:MM (예: 14:30)\n"
-                            "• **간격**: 양수 (시간 단위)",
+                            "• **간격**: 양수 (분 단위)",
                 color=0xff0000
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -241,7 +232,7 @@ async def update_schedule(
         day: int = None,
         hour: int = None,
         minute: int = None,
-        interval_hours: int = None
+        interval_minutes: int = None
 ):
     schedule = find_schedule_by_id(schedule_id, interaction.guild_id, interaction.user.id)
 
@@ -293,8 +284,8 @@ async def update_schedule(
             await interaction.response.send_message(embed=embed)
             return
 
-    if interval_hours:
-        schedule['interval'] = interval_hours * 60
+    if interval_minutes:
+        schedule['interval'] = interval_minutes * 60
         updates.append(f"반복 간격: {format_interval(schedule['interval'])}")
 
     if not updates:
@@ -385,7 +376,206 @@ async def schedule_info(interaction: discord.Interaction, schedule_id: int):
 
     await interaction.response.send_message(embed=embed)
 
-# 스케줄 실행 루프 (추후 구현을 위한 기본 구조)
+
+@bot.tree.command(name="export", description="내 스케줄 목록을 JSON 파일로 내보냅니다")
+async def export_schedules(interaction: discord.Interaction):
+    user_schedules = get_user_schedules(interaction.guild_id, interaction.user.id)
+
+    if not user_schedules:
+        embed = discord.Embed(
+            title="❌ 오류",
+            description="내보낼 스케줄이 없습니다.",
+            color=0xff0000
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+
+    # 사용자 스케줄을 export용 형태로 변환 (민감한 정보 제외)
+    export_data = {
+        "export_info": {
+            "user_id": interaction.user.id,
+            "username": interaction.user.display_name,
+            "guild_id": interaction.guild_id,
+            "export_date": datetime.datetime.now().isoformat(),
+            "total_schedules": len(user_schedules)
+        },
+        "schedules": []
+    }
+
+    for schedule in user_schedules:
+        export_schedule = {
+            "id": schedule['id'],
+            "channel": schedule['channel'],
+            "message": schedule['message'],
+            "date": schedule['date'],
+            "interval": schedule['interval'],
+            "last": schedule['last']
+        }
+        export_data["schedules"].append(export_schedule)
+
+    # JSON 파일 생성
+    json_content = json.dumps(export_data, indent=2, ensure_ascii=False)
+
+    # 파일 생성 및 전송
+    file = discord.File(
+        io.BytesIO(json_content.encode('utf-8')),
+        filename=f"schedules_{interaction.user.display_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    )
+
+    embed = discord.Embed(
+        title="📤 스케줄 내보내기 완료",
+        color=0x00ff00,
+        timestamp=datetime.datetime.now()
+    )
+    embed.add_field(name="📊 내보낸 스케줄 수", value=f"{len(user_schedules)}개", inline=True)
+    embed.add_field(name="📅 내보내기 날짜", value=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), inline=True)
+    embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+    embed.set_footer(text="JSON 파일을 다운로드하여 백업하세요!")
+
+    await interaction.response.send_message(embed=embed, file=file, ephemeral=True)
+
+
+class ImportScheduleModal(discord.ui.Modal, title="📥 스케줄 가져오기 옵션"):
+    def __init__(self):
+        super().__init__()
+
+    json_content = discord.ui.TextInput(
+        label="JSON 내용",
+        placeholder="JSON 파일의 내용을 여기에 붙여넣으세요...",
+        style=discord.TextStyle.paragraph,
+        max_length=4000
+    )
+
+    overwrite = discord.ui.TextInput(
+        label="기존 스케줄 처리",
+        placeholder="덮어쓰기: overwrite, 추가: add (기본값: add)",
+        max_length=10,
+        default="add",
+        required=False
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        global next_id
+
+        try:
+            import_data = json.loads(self.json_content.value)
+
+            # JSON 구조 검증
+            if "schedules" not in import_data or not isinstance(import_data["schedules"], list):
+                raise ValueError("올바르지 않은 JSON 구조입니다.")
+
+            # 기존 스케줄 처리
+            if self.overwrite.value.lower() == "overwrite":
+                # 사용자의 기존 스케줄 모두 삭제
+                global schedules
+                schedules = [s for s in schedules
+                             if not (s['server'] == interaction.guild_id and s['user'] == interaction.user.id)]
+
+            imported_count = 0
+            skipped_count = 0
+
+            for schedule_data in import_data["schedules"]:
+                try:
+                    # 필수 필드 검증
+                    required_fields = ['channel', 'message', 'date', 'interval']
+                    if not all(field in schedule_data for field in required_fields):
+                        skipped_count += 1
+                        continue
+
+                    # 채널 존재 여부 확인
+                    channel = bot.get_channel(schedule_data['channel'])
+                    if not channel or channel.guild.id != interaction.guild_id:
+                        skipped_count += 1
+                        continue
+
+                    # 과거 시간 확인
+                    schedule_time = schedule_data['date']
+                    if schedule_data.get('last', 0) == 0:  # 아직 실행되지 않은 스케줄
+                        if schedule_time < time.time():
+                            skipped_count += 1
+                            continue
+
+                    new_schedule = {
+                        'id': next_id,
+                        'server': interaction.guild_id,
+                        'channel': schedule_data['channel'],
+                        'message': schedule_data['message'],
+                        'user': interaction.user.id,
+                        'date': schedule_data['date'],
+                        'interval': schedule_data['interval'],
+                        'last': schedule_data.get('last', 0)
+                    }
+
+                    schedules.append(new_schedule)
+                    next_id += 1
+                    imported_count += 1
+
+                except Exception as e:
+                    skipped_count += 1
+                    continue
+
+            embed = discord.Embed(
+                title="📥 스케줄 가져오기 완료",
+                color=0x00ff00,
+                timestamp=datetime.datetime.now()
+            )
+            embed.add_field(name="✅ 가져온 스케줄", value=f"{imported_count}개", inline=True)
+
+            if skipped_count > 0:
+                embed.add_field(name="⚠️ 건너뛴 스케줄", value=f"{skipped_count}개", inline=True)
+                embed.add_field(name="건너뛴 이유",
+                                value="• 채널이 존재하지 않음\n• 과거 시간 스케줄\n• 잘못된 데이터",
+                                inline=False)
+
+            embed.set_author(name=interaction.user.display_name, icon_url=interaction.user.avatar)
+            embed.set_footer(text="가져오기가 완료되었습니다!")
+
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        except json.JSONDecodeError:
+            embed = discord.Embed(
+                title="❌ JSON 오류",
+                description="올바르지 않은 JSON 형식입니다. 파일 내용을 다시 확인해주세요.",
+                color=0xff0000
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except ValueError as e:
+            embed = discord.Embed(
+                title="❌ 데이터 오류",
+                description=str(e),
+                color=0xff0000
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+        except Exception as e:
+            embed = discord.Embed(
+                title="❌ 오류",
+                description=f"가져오기 중 오류가 발생했습니다: {str(e)}",
+                color=0xff0000
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="import", description="JSON 파일에서 스케줄을 가져옵니다")
+async def import_schedules(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="📥 스케줄 가져오기",
+        description="**사용법:**\n"
+                    "1. 내보낸 JSON 파일을 텍스트 에디터로 열기\n"
+                    "2. 파일 내용 전체를 복사\n"
+                    "3. 모달 창에 붙여넣기\n"
+                    "4. 가져오기 옵션 선택\n\n"
+                    "**옵션:**\n"
+                    "• `add`: 기존 스케줄에 추가 (기본값)\n"
+                    "• `overwrite`: 기존 스케줄 삭제 후 가져오기",
+        color=0x3498db
+    )
+    embed.set_footer(text="아래 모달을 통해 JSON 내용을 입력하세요")
+
+    modal = ImportScheduleModal()
+    await interaction.response.send_modal(modal)
+
+
+# 스케줄 실행 루프
 @tasks.loop(seconds=60)  # 1분마다 확인
 async def check_schedules():
     current_time = int(time.time())
