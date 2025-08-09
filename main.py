@@ -11,7 +11,7 @@ load_dotenv()
 
 schedules = []
 
-next_id = 2  # 다음 스케줄 ID
+next_id = 1  # 다음 스케줄 ID
 
 intents = discord.Intents.default()
 intents.message_content = True
